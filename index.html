@@ -5,10 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Dual-Channel Call & ZIP Recording System</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- JSZip and FileSaver for local ZIP creation -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
-  <!-- PeerJS for WebRTC Audio Streaming -->
   <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <style>
     .pulse-red { animation: pulse 1.2s infinite; }
@@ -21,7 +19,6 @@
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col items-center justify-center p-4">
 
-  <!-- Remote Audio Playback Element -->
   <audio id="remoteAudio" autoplay playsinline class="hidden"></audio>
 
   <div class="w-full max-w-xl bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-6 relative overflow-hidden">
@@ -194,7 +191,6 @@
         <span id="rec-status-badge" class="text-xs bg-amber-900/60 text-amber-300 border border-amber-700 px-2.5 py-1 rounded-full">Connecting...</span>
       </div>
 
-      <!-- PARTICIPANTS DISPLAY CARDS -->
       <div class="grid grid-cols-2 gap-3">
         <div id="box-caller" class="bg-slate-900/90 border border-indigo-500/50 p-3 rounded-xl space-y-1">
           <div class="flex items-center justify-between">
@@ -215,7 +211,6 @@
         </div>
       </div>
 
-      <!-- Timer Banner -->
       <div class="text-center bg-slate-900 border border-slate-700 py-4 rounded-xl space-y-2">
         <p id="timer" class="text-4xl font-mono font-bold text-slate-100">00:00:00</p>
         <p id="waiting-banner" class="text-xs text-amber-400 bg-amber-950/40 border border-amber-800/60 py-1.5 px-4 rounded-full font-medium inline-block">
@@ -229,7 +224,6 @@
         </p>
       </div>
 
-      <!-- Controls -->
       <div class="space-y-2">
         <div id="host-controls" class="flex gap-3">
           <button id="btn-start-rec" onclick="startDualRecording()" disabled class="flex-1 bg-emerald-600 opacity-50 cursor-not-allowed text-white font-semibold py-3 rounded-lg transition shadow-lg">
@@ -245,7 +239,6 @@
         </button>
       </div>
 
-      <!-- Downloads Output -->
       <div id="download-section" class="hidden bg-slate-900 border border-slate-700 p-4 rounded-xl space-y-3">
         <h3 class="text-sm font-semibold text-emerald-400 border-b border-slate-800 pb-1">✅ Audio Output Files Ready</h3>
 
@@ -299,7 +292,6 @@
     let receiverCallsCount = 0;
     let callHistory = [];
 
-    // 🔥 OPTIMIZED TURN/STUN CONFIGURATION FOR INTER-NETWORK MOBILE DATA (JIO - AIRTEL)
     const peerOptions = {
       debug: 1,
       config: {
@@ -441,7 +433,6 @@
       initializePeer(null, pairId);
     }
 
-    // 🔧 ROBUST HANDSHAKE FOR CROSS-NETWORK MOBILE DATA
     function initializePeer(customId = null, targetPairId = null) {
       if (peer) { try { peer.destroy(); } catch(e){} }
 
@@ -733,7 +724,9 @@
       }, 1000);
     }
 
-    function stopTimer() { clearInterval(timerInterval); }
+    function stopTimer() {
+      clearInterval(timerInterval);
+    }
 
     function blobToBase64(blob) {
       return new Promise((resolve) => {
@@ -750,72 +743,132 @@
         .replace(/\s+/g, "_");
     }
 
+    // ============================================================
+    // UPDATED ONLY:
+    // WAV FILE NAME FORMAT:
+    // CallerName_unique_id.wav
+    // ReceiverName_unique_id.wav
+    // ============================================================
+
     function downloadCurrentZip() {
       if (!localAudioBlob) return alert("Audio files missing.");
+
       const zip = new JSZip();
 
-      // One unique ID is used for BOTH audio files.
-      // The filename always starts with the current user's name.
-      const userName = sanitizeFileName(userData.name);
+      // Same unique ID is used for BOTH audio files
       const uniqueId = currentPairId || "PAIR-DISCONNECTED";
 
-      zip.file(`${userName}_${uniqueId}_Caller.wav`, localAudioBlob);
+      // Caller name
+      const callerName = sanitizeFileName(userData.name);
+
+      // Receiver name
+      let receiverName = document.getElementById('room-receiver-name')
+        ? document.getElementById('room-receiver-name').textContent.trim()
+        : "Receiver";
+
+      // Remove "(You)" if present
+      receiverName = receiverName.replace(/\s*\(You\)\s*$/i, "");
+
+      receiverName = sanitizeFileName(receiverName || "Receiver");
+
+      // REQUIRED FILE NAMES
+      zip.file(`${callerName}_${uniqueId}.wav`, localAudioBlob);
+
       if (remoteAudioBlob) {
-        zip.file(`${userName}_${uniqueId}_Receiver.wav`, remoteAudioBlob);
+        zip.file(`${receiverName}_${uniqueId}.wav`, remoteAudioBlob);
       }
 
+      // ZIP filename remains unchanged
       zip.generateAsync({ type: "blob" }).then(content => {
-        saveAs(content, `${userName}_${uniqueId}_DualAudio.zip`);
+        saveAs(content, `${callerName}_${uniqueId}_DualAudio.zip`);
       });
     }
 
     function downloadHistoryZip(index) {
       const record = callHistory[index];
-      if (!record || !record.localData) return alert("Audio record missing.");
+
+      if (!record || !record.localData) {
+        return alert("Audio record missing.");
+      }
 
       const zip = new JSZip();
-      const localBlob = dataURItoBlob(record.localData);
-      const remoteBlob = record.remoteData ? dataURItoBlob(record.remoteData) : localBlob;
 
-      // One unique ID is used for BOTH audio files.
-      // The filename starts with the user name saved with the recording.
-      const userName = sanitizeFileName(record.user);
+      const localBlob = dataURItoBlob(record.localData);
+      const remoteBlob = record.remoteData
+        ? dataURItoBlob(record.remoteData)
+        : localBlob;
+
+      // Same unique ID is used for BOTH audio files
       const uniqueId = record.id || "PAIR-DISCONNECTED";
 
-      zip.file(`${userName}_${uniqueId}_Caller.wav`, localBlob);
-      zip.file(`${userName}_${uniqueId}_Receiver.wav`, remoteBlob);
+      // Caller name
+      const callerName = sanitizeFileName(record.user);
 
+      // Receiver name
+      let receiverName = document.getElementById('room-receiver-name')
+        ? document.getElementById('room-receiver-name').textContent.trim()
+        : "Receiver";
+
+      // Remove "(You)" if present
+      receiverName = receiverName.replace(/\s*\(You\)\s*$/i, "");
+
+      receiverName = sanitizeFileName(receiverName || "Receiver");
+
+      // REQUIRED FILE NAMES
+      zip.file(`${callerName}_${uniqueId}.wav`, localBlob);
+
+      zip.file(`${receiverName}_${uniqueId}.wav`, remoteBlob);
+
+      // ZIP filename remains unchanged
       zip.generateAsync({ type: "blob" }).then(content => {
-        saveAs(content, `${userName}_${uniqueId}_DualAudio.zip`);
+        saveAs(content, `${callerName}_${uniqueId}_DualAudio.zip`);
       });
     }
 
     function dataURItoBlob(dataURI) {
       const byteString = atob(dataURI.split(',')[1]);
       const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0];
+
       const ab = new ArrayBuffer(byteString.length);
       const ia = new Uint8Array(ab);
-      for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
+
+      for (let i = 0; i < byteString.length; i++) {
+        ia[i] = byteString.charCodeAt(i);
+      }
+
       return new Blob([ab], { type: mimeString });
     }
 
     function saveHistoryData() {
       localStorage.setItem('rec_caller_count', callerCallsCount);
       localStorage.setItem('rec_receiver_count', receiverCallsCount);
+
       try {
-        localStorage.setItem('rec_history_list', JSON.stringify(callHistory.slice(0, 10)));
+        localStorage.setItem(
+          'rec_history_list',
+          JSON.stringify(callHistory.slice(0, 10))
+        );
       } catch(e) {}
     }
 
     function loadSavedData() {
       const prof = localStorage.getItem('rec_user_profile');
-      if (prof) userData = JSON.parse(prof);
 
-      callerCallsCount = parseInt(localStorage.getItem('rec_caller_count')) || 0;
-      receiverCallsCount = parseInt(localStorage.getItem('rec_receiver_count')) || 0;
+      if (prof) {
+        userData = JSON.parse(prof);
+      }
+
+      callerCallsCount =
+        parseInt(localStorage.getItem('rec_caller_count')) || 0;
+
+      receiverCallsCount =
+        parseInt(localStorage.getItem('rec_receiver_count')) || 0;
 
       const hist = localStorage.getItem('rec_history_list');
-      if (hist) callHistory = JSON.parse(hist);
+
+      if (hist) {
+        callHistory = JSON.parse(hist);
+      }
     }
 
     function updateHistoryUI() {
@@ -823,8 +876,13 @@
       document.getElementById('count-receiver').textContent = receiverCallsCount;
 
       const historyList = document.getElementById('history-list');
+
       if (!callHistory || callHistory.length === 0) {
-        historyList.innerHTML = `<p class="text-xs text-slate-500 text-center py-4 bg-slate-900/50 rounded-lg">कोई रिकॉर्डिंग हिस्ट्री मौजूद नहीं है।</p>`;
+        historyList.innerHTML = `
+          <p class="text-xs text-slate-500 text-center py-4 bg-slate-900/50 rounded-lg">
+            कोई रिकॉर्डिंग हिस्ट्री मौजूद नहीं है।
+          </p>
+        `;
         return;
       }
 
@@ -835,9 +893,16 @@
               <span class="font-mono font-bold text-indigo-400">${rec.id}</span>
               <span class="bg-slate-800 text-amber-300 font-mono text-[10px] px-2 py-0.5 rounded border border-slate-700">${rec.lang}</span>
             </div>
-            <p class="text-slate-400 text-[11px]">⏱️ ${rec.duration} | 🕒 ${rec.time}</p>
+
+            <p class="text-slate-400 text-[11px]">
+              ⏱️ ${rec.duration} | 🕒 ${rec.time}
+            </p>
           </div>
-          <button onclick="downloadHistoryZip(${i})" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1">
+
+          <button
+            onclick="downloadHistoryZip(${i})"
+            class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1"
+          >
             <span>📦</span> ZIP
           </button>
         </div>
