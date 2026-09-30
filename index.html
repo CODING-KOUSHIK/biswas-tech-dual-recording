@@ -277,9 +277,15 @@
     let localStream = null;
     let remoteStream = null;
 
+    // PCM/WAV recording state.
+    // These variables keep their original names so the rest of the application
+    // (history, downloads and ZIP creation) remains unchanged.
     let localRecorder, remoteRecorder;
     let localChunks = [], remoteChunks = [];
     let localAudioBlob = null, remoteAudioBlob = null;
+    const WAV_SAMPLE_RATE = 16000;
+    const WAV_CHANNELS = 1;
+    const WAV_BITS_PER_SAMPLE = 16;
     let isRecording = false;
     let historySaved = false;
     let userDisconnectedManual = false;
@@ -559,20 +565,246 @@
       executeStartRecording();
     }
 
+    // ============================================================
+    // REAL PCM WAV RECORDER
+    // ============================================================
+    // Captures audio through Web Audio API, converts it to mono 16-bit PCM
+    // at exactly 16 kHz, and stores only the final PCM samples in memory.
+    // No WebM/Opus data is created or renamed.
+    //
+    // A zero-gain output is used only to keep ScriptProcessorNode active.
+    // It produces no audible output and does not change the recorded data.
+    function createPCMRecorder(mediaStream, outputSamples) {
+      if (!mediaStream) throw new Error("Audio stream is not available.");
+
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) {
+        throw new Error("Web Audio API is not supported by this browser.");
+      }
+
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(mediaStream);
+      const processor = audioContext.createScriptProcessor(4096, 2, 1);
+      const silentGain = audioContext.createGain();
+
+      silentGain.gain.value = 0;
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+
+      const resampler = {
+        inputSampleRate: audioContext.sampleRate,
+        ratio: audioContext.sampleRate / WAV_SAMPLE_RATE,
+        nextSourcePosition: 0,
+        previousSample: null
+      };
+
+      let state = 'inactive';
+      let stopResolve = null;
+      let stopPromise = null;
+
+      processor.onaudioprocess = (event) => {
+        if (state !== 'recording') return;
+
+        const inputBuffer = event.inputBuffer;
+        const frameCount = inputBuffer.length;
+        const channelCount = inputBuffer.numberOfChannels;
+
+        // Mix all incoming channels to mono. For the normal voice stream this
+        // is usually one channel, but this also handles a stereo remote track.
+        const mono = new Float32Array(frameCount);
+
+        if (channelCount === 1) {
+          inputBuffer.copyFromChannel(mono, 0);
+        } else {
+          for (let ch = 0; ch < channelCount; ch++) {
+            const channel = new Float32Array(frameCount);
+            inputBuffer.copyFromChannel(channel, ch);
+            for (let i = 0; i < frameCount; i++) {
+              mono[i] += channel[i] / channelCount;
+            }
+          }
+        }
+
+        const samples16k = resampleMonoTo16k(mono, resampler);
+
+        // Convert directly to signed 16-bit PCM. This keeps memory usage much
+        // lower than retaining large Float32 audio buffers.
+        for (let i = 0; i < samples16k.length; i++) {
+          let sample = samples16k[i];
+
+          if (sample > 1) sample = 1;
+          else if (sample < -1) sample = -1;
+
+          outputSamples.push(
+            sample < 0
+              ? Math.round(sample * 32768)
+              : Math.round(sample * 32767)
+          );
+        }
+      };
+
+      return {
+        get state() {
+          return state;
+        },
+
+        start: async function() {
+          if (state !== 'inactive') return;
+
+          await audioContext.resume();
+          state = 'recording';
+        },
+
+        stop: function() {
+          if (state === 'inactive') return Promise.resolve();
+          if (stopPromise) return stopPromise;
+
+          state = 'stopping';
+
+          stopPromise = new Promise((resolve) => {
+            stopResolve = resolve;
+
+            // Give the audio engine a chance to deliver the final
+            // ScriptProcessor buffer before disconnecting it.
+            setTimeout(async () => {
+              try {
+                if (audioContext.state !== 'closed') {
+                  await audioContext.close();
+                }
+              } catch (e) {
+                console.warn("AudioContext close warning:", e);
+              }
+
+              processor.onaudioprocess = null;
+              try { source.disconnect(); } catch (e) {}
+              try { processor.disconnect(); } catch (e) {}
+              try { silentGain.disconnect(); } catch (e) {}
+
+              state = 'inactive';
+
+              if (stopResolve) stopResolve();
+            }, 100);
+          });
+
+          return stopPromise;
+        }
+      };
+    }
+
+    // Streaming linear resampler. It works even when the browser's actual
+    // AudioContext sample rate is 48 kHz (or another rate), so the output
+    // WAV is still exactly 16,000 samples/second.
+    function resampleMonoTo16k(input, state) {
+      const ratio = state.ratio;
+
+      if (input.length === 0) return [];
+
+      let data;
+
+      if (state.previousSample === null) {
+        data = input;
+      } else {
+        data = new Float32Array(input.length + 1);
+        data[0] = state.previousSample;
+        data.set(input, 1);
+      }
+
+      const result = [];
+
+      let position = state.nextSourcePosition;
+
+      while (position < data.length - 1) {
+        const index = Math.floor(position);
+        const fraction = position - index;
+
+        const sample =
+          data[index] +
+          (data[index + 1] - data[index]) * fraction;
+
+        result.push(sample);
+        position += ratio;
+      }
+
+      state.previousSample = data[data.length - 1];
+      state.nextSourcePosition = position - (data.length - 1);
+
+      return result;
+    }
+
+    // Builds a standards-compliant PCM RIFF/WAVE file:
+    // RIFF + fmt  + data
+    // PCM, mono, 16-bit, 16,000 Hz, correct byte rate and data size.
+    function encodePCMToWav(samples, sampleRate) {
+      const bytesPerSample = WAV_BITS_PER_SAMPLE / 8;
+      const dataSize = samples.length * bytesPerSample;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      writeAscii(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeAscii(view, 8, 'WAVE');
+
+      writeAscii(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);                  // PCM fmt chunk size
+      view.setUint16(20, 1, true);                   // Audio format: PCM
+      view.setUint16(22, WAV_CHANNELS, true);        // Mono
+      view.setUint32(24, sampleRate, true);          // 16,000 Hz
+      view.setUint32(
+        28,
+        sampleRate * WAV_CHANNELS * bytesPerSample,
+        true
+      );                                             // Byte rate
+      view.setUint16(
+        32,
+        WAV_CHANNELS * bytesPerSample,
+        true
+      );                                             // Block align
+      view.setUint16(34, WAV_BITS_PER_SAMPLE, true); // 16-bit
+
+      writeAscii(view, 36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      let offset = 44;
+
+      for (let i = 0; i < samples.length; i++, offset += 2) {
+        view.setInt16(offset, samples[i], true);
+      }
+
+      return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    function writeAscii(view, offset, text) {
+      for (let i = 0; i < text.length; i++) {
+        view.setUint8(offset + i, text.charCodeAt(i));
+      }
+    }
+
     function executeStartRecording() {
       localChunks = [];
       remoteChunks = [];
       isRecording = true;
       historySaved = false;
 
-      localRecorder = new MediaRecorder(localStream);
-      localRecorder.ondataavailable = e => { if (e.data.size > 0) localChunks.push(e.data); };
-      localRecorder.start(1000);
+      // MediaRecorder is intentionally NOT used here. It normally produces
+      // WebM/Opus in Chromium, which cannot be made into a real WAV by
+      // changing the Blob MIME type. Instead, capture PCM samples directly
+      // and encode a genuine 16 kHz / mono / 16-bit RIFF WAV at the end.
+      try {
+        localRecorder = createPCMRecorder(localStream, localChunks);
+        localRecorder.start();
 
-      if (remoteStream) {
-        remoteRecorder = new MediaRecorder(remoteStream);
-        remoteRecorder.ondataavailable = e => { if (e.data.size > 0) remoteChunks.push(e.data); };
-        remoteRecorder.start(1000);
+        if (remoteStream) {
+          remoteRecorder = createPCMRecorder(remoteStream, remoteChunks);
+          remoteRecorder.start();
+        } else {
+          remoteRecorder = null;
+        }
+      } catch (e) {
+        console.error("PCM recorder start error:", e);
+        isRecording = false;
+        alert("Unable to start audio recording. Please check microphone/audio permissions.");
+        return;
       }
 
       startTimer();
@@ -603,17 +835,21 @@
       executeStopRecording();
     }
 
-    function executeStopRecording() {
+    async function executeStopRecording() {
       if (!isRecording && historySaved) return;
       isRecording = false;
       stopTimer();
 
-      if (localRecorder && localRecorder.state !== 'inactive') localRecorder.stop();
-      if (remoteRecorder && remoteRecorder.state !== 'inactive') remoteRecorder.stop();
+      // Stop both PCM capture pipelines first. Their stop() methods resolve
+      // only after the final audio buffer has been captured.
+      try {
+        if (localRecorder && localRecorder.state !== 'inactive') await localRecorder.stop();
+        if (remoteRecorder && remoteRecorder.state !== 'inactive') await remoteRecorder.stop();
+      } catch (e) {
+        console.error("PCM recorder stop error:", e);
+      }
 
-      setTimeout(async () => {
-        saveRecordedDataToHistory();
-      }, 500);
+      await saveRecordedDataToHistory();
 
       document.getElementById('rec-status-badge').textContent = "Stopped";
       document.getElementById('rec-status-badge').className = "text-xs bg-slate-700 px-2.5 py-1 rounded-full text-slate-400";
@@ -641,8 +877,13 @@
       if (localChunks.length === 0) return;
 
       historySaved = true;
-      localAudioBlob = new Blob(localChunks, { type: 'audio/wav' });
-      remoteAudioBlob = remoteChunks.length > 0 ? new Blob(remoteChunks, { type: 'audio/wav' }) : localAudioBlob;
+
+      // localChunks/remoteChunks contain raw signed 16-bit PCM samples.
+      // Encode them as actual RIFF/WAVE files with correct metadata.
+      localAudioBlob = encodePCMToWav(localChunks, WAV_SAMPLE_RATE);
+      remoteAudioBlob = remoteChunks.length > 0
+        ? encodePCMToWav(remoteChunks, WAV_SAMPLE_RATE)
+        : localAudioBlob;
 
       document.getElementById('dl-local').href = URL.createObjectURL(localAudioBlob);
       document.getElementById('dl-remote').href = URL.createObjectURL(remoteAudioBlob);
